@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=1.0.0
+VERSION=1.1.0
 PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
 STATE="$HOME/.local/share/termux-cf-node"
 CURRENT="$STATE/current"
@@ -127,24 +127,210 @@ valid_token() {
         (.s | type == "string" and length > 0)
     ' >/dev/null 2>&1
 }
-read_token() {
-    local destination=$1 allow_keep=${2:-no} value
+read_api_token() {
+    local destination=$1 value
+    say 'API Token 权限：Account / Cloudflare Tunnel / Edit；Zone / Zone / Read；Zone / DNS / Edit。'
+    say '资源范围需包含节点域名及其所属账户。输入 API Token，脚本会自动创建/配置 Tunnel 和 DNS。'
     while true; do
-        printf '粘贴 Tunnel Token（隐藏输入%s）：' "$( [[ "$allow_keep" == yes ]] && printf '，回车保留' )" >&2
+        printf '粘贴 Cloudflare API Token（隐藏输入）：' >&2
         IFS= read -rs value || die '输入结束。'
         printf '\n' >&2
-        if [[ -z "$value" && "$allow_keep" == yes ]]; then
-            cp -- "$CURRENT/tunnel.token" "$destination"
-            return
-        fi
         if valid_token "$value"; then
-            printf '%s' "$value" > "$destination"
+            say '这是用于连接已有 Tunnel 的 Tunnel Token；自动部署需要有上述权限的 API Token。'
+        elif [[ "$value" =~ ^[a-zA-Z0-9._~-]{20,}$ ]]; then
+            printf 'Authorization: Bearer %s\n' "$value" > "$destination"
             chmod 600 "$destination"
             unset value
             return
+        else
+            say '格式不正确。请只粘贴 API Token，不要粘贴安装命令、Global API Key 或 Bearer 前缀。'
         fi
-        say '格式不正确。请只粘贴 Tunnel Token，不要粘贴整条安装命令或 Cloudflare API Token。'
     done
+}
+cf_api() {
+    local method=$1 path=$2 output=$3 body=${4:-} code
+    local -a args=(--disable --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30
+        --request "$method" --header "@${CF_AUTH_FILE:?}" --header 'Content-Type: application/json'
+        --output "$output" --write-out '%{http_code}')
+    # Retry reads only. Retrying a timed-out POST could create duplicate resources.
+    [[ "$method" != GET ]] || args+=(--retry 2 --retry-delay 1)
+    [[ -z "$body" ]] || args+=(--data-binary "@$body")
+    if ! code=$(curl "${args[@]}" "https://api.cloudflare.com/client/v4$path"); then
+        say "Cloudflare API 网络请求失败：$method ${path%%\?*}；可重新运行以恢复未完成的部署。" >&2
+        CF_HTTP_STATUS=${code:-000}
+        return 1
+    fi
+    CF_HTTP_STATUS=$code
+    if [[ "$code" != 2?? ]] || ! jq -e '.success == true' "$output" >/dev/null 2>&1; then
+        say "Cloudflare API 失败：HTTP $code，$method ${path%%\?*}" >&2
+        jq -r '.errors[]? | "  错误 \(.code): \(.message)"' "$output" >&2 2>/dev/null || true
+        return 1
+    fi
+}
+cf_find_zone() {
+    local domain=$1 output=$2 candidate=$1 count
+    # Exact suffix queries choose the most specific accessible zone, including co.uk / subzones.
+    while [[ "$candidate" == *.* ]]; do
+        cf_api GET "/zones?name=$candidate&per_page=50" "$output" || return 1
+        count=$(jq --arg name "$candidate" '[.result[] | select(.name == $name)] | length' "$output") || return 1
+        if ((count > 0)); then
+            if [[ "$count" != 1 ]] || ! jq -e '.result[0].status == "active"' "$output" >/dev/null; then
+                say "域名 Zone $candidate 不唯一或尚未激活，请检查域名授权及托管状态。" >&2
+                return 1
+            fi
+            jq --arg name "$candidate" '.result[] | select(.name == $name)' "$output" > "$output.zone" || return 1
+            mv -f -- "$output.zone" "$output"
+            return
+        fi
+        candidate=${candidate#*.}
+    done
+    say "找不到 $domain 对应的 Zone。请检查 Zone Read 权限、资源范围及域名托管状态。" >&2
+    return 1
+}
+cf_token_ids() {
+    local file=$1
+    [[ -s "$file" ]] || return 1
+    jq -eRs '@base64d | fromjson | select((.a | test("^[a-fA-F0-9]{32}$")) and (.t | test("^[a-fA-F0-9-]{36}$"))) | {account_id:.a,tunnel_id:.t}' "$file" 2>/dev/null
+}
+cf_build_ingress() {
+    local original=$1 domain=$2 port=$3 output=$4
+    jq --arg host "$domain" --arg service "http://127.0.0.1:$port" '
+        (.result.config // {}) |
+        (.ingress // []) as $old |
+        (if ($old | length) == 0 then [{service:"http_status:404"}] else $old end) as $rules |
+        if (($rules[-1].hostname // "") != "" or ($rules[-1].path // "") != "") then
+            error("Tunnel 配置缺少最后一条 catch-all 规则")
+        elif any($rules[]; .hostname == $host and (.path // "") != "") then
+            error("该域名已有按路径路由的规则，请使用独立节点域名")
+        else
+            ($rules | map(select(.hostname != $host))) as $keep |
+            .ingress = ($keep[:-1] + [{hostname:$host,service:$service,originRequest:{}}] + $keep[-1:]) |
+            {config:.}
+        end
+    ' "$original" > "$output"
+}
+cf_provision() {
+    local staged=$1 api_dir domain port account zone tunnel='' tunnel_name install_id digest
+    local existing=false dns_id='' target current_target='' record_count file ids token candidate
+    local CF_AUTH_FILE CF_HTTP_STATUS=''
+    api_dir="$staged/.api"
+    mkdir -p "$api_dir"
+    CF_AUTH_FILE="$api_dir/auth.header"
+    read_api_token "$CF_AUTH_FILE"
+    domain=$(jq -er .domain "$staged/settings.json") || return 1
+    port=$(jq -er .port "$staged/settings.json") || return 1
+    cf_find_zone "$domain" "$api_dir/zone.json" || return 1
+    account=$(jq -er .account.id "$api_dir/zone.json") || return 1
+    zone=$(jq -er .id "$api_dir/zone.json") || return 1
+    [[ "$account" =~ ^[a-fA-F0-9]{32}$ && "$zone" =~ ^[a-fA-F0-9]{32}$ ]] || return 1
+    say "已识别 Zone：$(jq -r .name "$api_dir/zone.json")；账户：$account"
+
+    # Reuse the connector from this generation / current domain, including pre-1.1 installs.
+    # Reading an existing connector token is not the same as storing the API token.
+    for file in "$staged/tunnel.token" "$CURRENT/tunnel.token"; do
+        if [[ "$file" == "$CURRENT/tunnel.token" && "$(old_setting domain || true)" != "$domain" ]]; then continue; fi
+        if ids=$(cf_token_ids "$file"); then
+            if [[ $(jq -r .account_id <<< "$ids") == "$account" ]]; then
+                tunnel=$(jq -r .tunnel_id <<< "$ids")
+                break
+            fi
+        fi
+    done
+    if [[ ! -f "$STATE/installation.id" ]]; then
+        sing-box generate uuid > "$STATE/installation.id" || return 1
+    fi
+    install_id=$(cat "$STATE/installation.id")
+    valid_uuid "$install_id" || return 1
+    digest=$(printf '%s' "$domain" | sha256sum) || return 1
+    tunnel_name="tcf-node-$install_id-${digest:0:12}"
+    if [[ -n "$tunnel" ]]; then
+        cf_api GET "/accounts/$account/cfd_tunnel/$tunnel" "$api_dir/tunnel.json" || return 1
+        jq -e '.result.config_src == "cloudflare" and (.result.deleted_at == null)' "$api_dir/tunnel.json" >/dev/null || {
+            say '已有 Tunnel 不是可用的远程管理 Tunnel，请使用其他子域名部署。' >&2; return 1;
+        }
+        existing=true
+    else
+        cf_api GET "/accounts/$account/cfd_tunnel?name=$tunnel_name&is_deleted=false&per_page=100" "$api_dir/tunnels.json" || return 1
+        candidate=$(jq -er --arg name "$tunnel_name" '[.result[] | select(.name == $name and .deleted_at == null)] |
+            if length > 1 then error("多个同名 Tunnel") else .[0].id // empty end' "$api_dir/tunnels.json") || {
+            # An empty result is expected on the first run; malformed / ambiguous data is not.
+            jq -e --arg name "$tunnel_name" '[.result[] | select(.name == $name and .deleted_at == null)] | length == 0' "$api_dir/tunnels.json" >/dev/null || return 1
+            candidate=''
+        }
+        if [[ -n "$candidate" ]]; then tunnel=$candidate; existing=true; fi
+    fi
+    [[ -z "$tunnel" ]] || valid_uuid "$tunnel" || return 1
+
+    # Inspect DNS before creating anything. Only this phone's known connector may be replaced.
+    cf_api GET "/zones/$zone/dns_records?name=$domain&per_page=100" "$api_dir/dns.json" || return 1
+    record_count=$(jq --arg name "$domain" '[.result[] | select(.name == $name)] | length' "$api_dir/dns.json") || return 1
+    if ((record_count > 0)); then
+        if [[ "$(old_setting domain || true)" == "$domain" ]] && ids=$(cf_token_ids "$CURRENT/tunnel.token"); then
+            if [[ $(jq -r .account_id <<< "$ids") == "$account" ]]; then
+                current_target="$(jq -r .tunnel_id <<< "$ids").cfargotunnel.com"
+            fi
+        fi
+        target="${tunnel:-not-created}.cfargotunnel.com"
+        if [[ "$record_count" != 1 ]] || ! jq -e --arg target "$target" --arg previous "$current_target" '
+            .result[0] | .type == "CNAME" and
+            ((.content | ascii_downcase | rtrimstr(".")) == $target or
+             ($previous != "" and (.content | ascii_downcase | rtrimstr(".")) == $previous))
+        ' "$api_dir/dns.json" >/dev/null; then
+            say "DNS 冲突：$domain 已有不属于本节点的记录；未覆盖，请使用未占用的子域名。" >&2
+            return 1
+        fi
+        dns_id=$(jq -er .result[0].id "$api_dir/dns.json") || return 1
+    fi
+    if [[ "$existing" == false ]]; then
+        jq -n --arg name "$tunnel_name" '{name:$name,config_src:"cloudflare"}' > "$api_dir/create.json" || return 1
+        cf_api POST "/accounts/$account/cfd_tunnel" "$api_dir/tunnel.json" "$api_dir/create.json" || return 1
+        tunnel=$(jq -er .result.id "$api_dir/tunnel.json") || return 1
+        valid_uuid "$tunnel" || return 1
+        say "已创建 Tunnel：$tunnel。中途失败时重新运行会复用该 Tunnel。"
+        printf '{"result":{"config":{}}}\n' > "$api_dir/original.json"
+    else
+        say "复用已有 Tunnel：$tunnel"
+        if ! cf_api GET "/accounts/$account/cfd_tunnel/$tunnel/configurations" "$api_dir/original.json"; then
+            [[ "$CF_HTTP_STATUS" == 404 ]] || return 1
+            printf '{"result":{"config":{}}}\n' > "$api_dir/original.json"
+        fi
+    fi
+    cf_api GET "/accounts/$account/cfd_tunnel/$tunnel/token" "$api_dir/token.json" || return 1
+    token=$(jq -er '.result | strings' "$api_dir/token.json") || return 1
+    valid_token "$token" || { say 'Cloudflare 返回了无效的 Tunnel Token。' >&2; return 1; }
+    printf '%s' "$token" > "$staged/tunnel.token"
+    unset token
+    cf_build_ingress "$api_dir/original.json" "$domain" "$port" "$api_dir/config.json" || return 1
+    cf_api PUT "/accounts/$account/cfd_tunnel/$tunnel/configurations" "$api_dir/config-result.json" "$api_dir/config.json" || return 1
+    target="$tunnel.cfargotunnel.com"
+    jq -n --arg host "$domain" --arg target "$target" '{type:"CNAME",name:$host,content:$target,proxied:true,ttl:1}' > "$api_dir/record.json" || return 1
+    if [[ -z "$dns_id" ]]; then
+        if cf_api POST "/zones/$zone/dns_records" "$api_dir/record-result.json" "$api_dir/record.json"; then
+            dns_id=$(jq -er .result.id "$api_dir/record-result.json") || return 1
+        else
+            cf_restore_config "$account" "$tunnel" "$api_dir"
+            return 1
+        fi
+    elif ! cf_api PATCH "/zones/$zone/dns_records/$dns_id" "$api_dir/record-result.json" "$api_dir/record.json"; then
+        cf_restore_config "$account" "$tunnel" "$api_dir"
+        return 1
+    fi
+    jq -n --arg account_id "$account" --arg zone_id "$zone" --arg tunnel_id "$tunnel" --arg dns_id "$dns_id" \
+        '{account_id:$account_id,zone_id:$zone_id,tunnel_id:$tunnel_id,dns_id:$dns_id}' > "$staged/cloudflare.json" || return 1
+    jq '.provisioning="api"' "$staged/settings.json" > "$api_dir/settings.json" || return 1
+    mv -f -- "$api_dir/settings.json" "$staged/settings.json" || return 1
+    rm -rf -- "$api_dir"
+    say "Cloudflare 已配置：$domain → $target → http://127.0.0.1:$port"
+}
+cf_restore_config() {
+    local account=$1 tunnel=$2 api_dir=$3
+    jq '{config:(if (.result.config.ingress // [] | length) > 0 then .result.config else {ingress:[{service:"http_status:404"}]} end)}' \
+        "$api_dir/original.json" > "$api_dir/restore.json" || return 1
+    if cf_api PUT "/accounts/$account/cfd_tunnel/$tunnel/configurations" "$api_dir/restore-result.json" "$api_dir/restore.json"; then
+        say 'DNS 写入失败，已恢复修改前的 Tunnel 回源配置；可修正权限后重试。' >&2
+    else
+        say "DNS 写入失败且回源恢复未成功；请重新运行部署修复 Tunnel $tunnel。" >&2
+    fi
 }
 generate_server() {
     local metadata=$1 destination=$2
@@ -176,19 +362,22 @@ show_guide() {
     local domain=$1 port=$2
     cat <<EOF
 
-Cloudflare 控制台一次性配置：
-  1. 域名托管到 Cloudflare，进入 Cloudflare One / Zero Trust 的 Tunnels。
-  2. 创建 cloudflared 类型的 Tunnel，复制安装命令里的 Tunnel Token。
-  3. 为该 Tunnel 添加 Published application / Public hostname：
-       Hostname : $domain
-       Type     : HTTP
-       URL      : 127.0.0.1:$port
-       Path     : 留空（节点的 WS Path 由手机服务端检查）
-  4. 保存后，确认域名路由和 Tunnel 状态。手机无需开放入站端口。
+自动部署只需：已托管到 Cloudflare 的域名，以及一个 API Token。
+  Token 权限：Account / Cloudflare Tunnel / Edit
+              Zone / Zone / Read
+              Zone / DNS / Edit
+  资源范围：包括节点域名及其所属账户。
+
+脚本将自动识别账户和 Zone，创建/复用 Tunnel，并配置：
+  Hostname : $domain
+  Type     : HTTP
+  URL      : 127.0.0.1:$port
+  DNS      : proxied CNAME → Tunnel
+无需在网页端手动创建 Tunnel 或添加域名映射。
 
 节点客户端使用域名的 443/WSS；手机本地使用 HTTP/WS。
 普通代理客户端无法完成 Cloudflare Access 的浏览器登录，请使用兼容的访问策略。
-本脚本不使用 Cloudflare API，因此以上远程创建和域名映射需要你在控制台完成。
+API Token 只在配置过程中临时使用；后台仅保存运行所需的 Tunnel Token。
 EOF
 }
 install_manager() {
@@ -313,7 +502,7 @@ activate_generation() {
     done
 }
 configure() {
-    local domain port uuid path name protocol dns cf_help keep=no
+    local domain port uuid path name protocol dns cf_help
     say '将从 Termux 软件源安装 sing-box、cloudflared、runit 管理及必要工具。'
     pkg update -y
     pkg install -y sing-box cloudflared termux-services jq curl util-linux coreutils
@@ -357,8 +546,6 @@ configure() {
     done
     show_guide "$domain" "$port"
     TMP_WORK=$(mktemp -d "$STATE/.stage.XXXXXXXX")
-    [[ ! -s "$CURRENT/tunnel.token" ]] || keep=yes
-    read_token "$TMP_WORK/tunnel.token" "$keep"
     jq -n --arg domain "$domain" --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
         --arg name "$name" --arg protocol "$protocol" --arg dns "$dns" \
         '{domain:$domain, port:$port, uuid:$uuid, path:$path, name:$name, protocol:$protocol, dns:$dns}' \
@@ -366,7 +553,10 @@ configure() {
     generate_server "$TMP_WORK/settings.json" "$TMP_WORK/server.json"
     generate_exports "$TMP_WORK"
     sing-box check -c "$TMP_WORK/server.json"
-    if ! confirm '保存配置并启动本节点'; then say '已取消，原配置和原服务保持原状。'; return; fi
+    if ! confirm '使用 API Token 自动创建/更新 Tunnel、DNS，并保存配置启动本节点'; then
+        say '已取消，原配置和原服务保持原状。'; return
+    fi
+    cf_provision "$TMP_WORK"
     activate_generation "$TMP_WORK"
     install_manager
     write_services
@@ -415,11 +605,12 @@ enable_boot() {
 change_token() {
     require_config
     TMP_WORK=$(mktemp -d "$STATE/.stage.XXXXXXXX")
-    cp -- "$CURRENT/"{settings.json,server.json,node.txt,clash-meta.json} "$TMP_WORK/"
-    read_token "$TMP_WORK/tunnel.token"
+    cp -- "$CURRENT/"{settings.json,server.json,node.txt,clash-meta.json,tunnel.token} "$TMP_WORK/"
+    cf_provision "$TMP_WORK"
     activate_generation "$TMP_WORK"
+    install_manager
     start_services
-    say 'Token 已替换。更换到其他 Tunnel 后，仍需在该 Tunnel 配置相同域名映射。'
+    say 'Cloudflare 配置和后台运行 Token 已更新，API Token 未保存。'
 }
 rollback() {
     [[ -L "$STATE/previous" && -d "$STATE/previous" ]] || die '没有上一份配置。'
@@ -428,6 +619,17 @@ rollback() {
     previous=$(readlink "$STATE/previous")
     current=$(readlink "$CURRENT")
     sing-box check -c "$STATE/previous/server.json"
+    if [[ "$(old_setting provisioning || true)" == api ]] ||
+        [[ "$(jq -r '.provisioning // empty' "$STATE/previous/settings.json")" == api ]]; then
+        say '回退涉及 API 管理的配置，请重新输入 API Token，以同步远程回源及 DNS。'
+        TMP_WORK=$(mktemp -d "$STATE/.stage.XXXXXXXX")
+        cp -- "$STATE/previous/"{settings.json,server.json,node.txt,clash-meta.json,tunnel.token} "$TMP_WORK/"
+        cf_provision "$TMP_WORK"
+        activate_generation "$TMP_WORK"
+        start_services
+        show_node
+        return
+    fi
     stop_services
     ln -sfn -- "$previous" "$STATE/.current.new"
     mv -Tf -- "$STATE/.current.new" "$CURRENT"
@@ -530,8 +732,8 @@ Termux Cloudflare VLESS/WS 节点 v$VERSION
   3) 停止                 4) 重启
   5) 进程状态             6) 分享链接 / 二维码
   7) 本地 / 公网诊断       8) 查看日志
-  9) 更换 Tunnel Token   10) 启用开机启动
- 11) 关闭开机启动        12) Cloudflare 配置指引
+  9) 重配 Cloudflare    10) 启用开机启动
+ 11) 关闭开机启动        12) API Token 权限说明
  13) 回退上一份配置      14) 卸载本地节点
   0) 退出
 EOF
@@ -570,7 +772,7 @@ main() {
         token) require_tools; lock_action; change_token ;;
         boot-on) require_tools; lock_action; enable_boot ;;
         boot-off) rm -f -- "$BOOT"; say '已删除本节点开机脚本，当前服务保持运行。' ;;
-        guide) require_tools; require_config; show_guide "$(setting domain)" "$(setting port)" ;;
+        guide) require_tools; show_guide "$(old_setting domain || printf node.example.com)" "$(old_setting port || printf 8080)" ;;
         rollback) require_tools; lock_action; rollback ;;
         uninstall) require_tools; lock_action; uninstall_node ;;
         *) die '未知命令。使用 --help 查看用法。' ;;
