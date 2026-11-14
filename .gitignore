@@ -1,0 +1,7 @@
+# Generated release archive and local runtime credentials / output.
+*.zip
+*.token
+*.log
+.env
+.env.*
+__pycache__/
